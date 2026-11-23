@@ -17,6 +17,7 @@
 # This file is a part of the vllm-ascend project.
 #
 
+from collections.abc import Iterator
 from dataclasses import dataclass, replace
 from typing import TYPE_CHECKING
 
@@ -36,7 +37,7 @@ from vllm.v1.worker.gpu.pcp_manager import PCPManager
 from vllm.v1.worker.utils import AttentionGroup
 
 from vllm_ascend.ops.rotary_embedding import update_cos_sin
-from vllm_ascend.utils import vllm_version_is
+from vllm_ascend.utils import get_max_replicated_pcp_prefill, vllm_version_is
 from vllm_ascend.worker.v2.attn_utils import build_attn_state
 from vllm_ascend.worker.v2.input_batch import AscendInputBatch, AscendInputBuffers
 
@@ -201,6 +202,54 @@ class AscendPCPManager(PCPManager):
     def bind_config(self, vllm_config: VllmConfig) -> None:
         self.vllm_config = vllm_config
         self.shard_decode_requests: bool = self.shard_decode_requests and self.is_decode_sharded
+
+    def replicated_requests(self, num_scheduled_tokens: np.ndarray, is_prefilling: np.ndarray) -> np.ndarray:
+        if self.dcp_world_size <= 1:
+            return super().replicated_requests(num_scheduled_tokens, is_prefilling)
+
+        pcp_size = self.pcp_world_size
+        query_lens = np.asarray(num_scheduled_tokens, dtype=np.int64)
+        # Below 3P tokens, only a length of 2P gives every rank a full head
+        # chunk and at least one tail token.
+        lacks_tail = (query_lens <= get_max_replicated_pcp_prefill(pcp_size)) & (query_lens != 2 * pcp_size)
+        return ~np.asarray(is_prefilling, dtype=np.bool_) | lacks_tail
+
+    def _iter_rank_chunks(
+        self, rank: int, num_scheduled_tokens: np.ndarray, is_prefilling: np.ndarray
+    ) -> Iterator[tuple[int, int, int]]:
+        if self.dcp_world_size <= 1:
+            yield from super()._iter_rank_chunks(rank, num_scheduled_tokens, is_prefilling)
+            return
+
+        pcp_size = self.pcp_world_size
+        num_chunks = 2 * pcp_size
+        tail_index = pcp_size - 1 - rank
+        replicated = self.replicated_requests(num_scheduled_tokens, is_prefilling)
+        replicated_ordinal = 0
+        for req_idx, num_tokens in enumerate(num_scheduled_tokens):
+            query_len = int(num_tokens)
+            if query_len == 0:
+                continue
+            if replicated[req_idx]:
+                if not self.shard_decode_requests or replicated_ordinal % pcp_size == rank:
+                    yield req_idx, 0, query_len
+                replicated_ordinal += 1
+                continue
+
+            head_len = (query_len + num_chunks - 1) // num_chunks
+            yield req_idx, rank * head_len, head_len
+            if (num_chunks - 1) * head_len < query_len:
+                # All fixed-width chunks exist. Keep the original DualChunkSwap layout.
+                tail_offset = (pcp_size + tail_index) * head_len
+                tail_len = min(head_len, query_len - tail_offset)
+            else:
+                # Balance only the tails. Each rank keeps a full head so sparse
+                # attention charges the same two head-width chunks on every rank.
+                heads_end = pcp_size * head_len
+                tail_width, extra = divmod(query_len - heads_end, pcp_size)
+                tail_offset = heads_end + tail_index * tail_width + min(tail_index, extra)
+                tail_len = tail_width + int(tail_index < extra)
+            yield req_idx, tail_offset, tail_len
 
     @property
     def is_decode_sharded(self) -> bool:
